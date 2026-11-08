@@ -40,7 +40,7 @@ jobs:
           WORK=$(mktemp -d)
           trap 'rm -rf "$WORK"' EXIT
 
-          gh auth setup-git
+          git config --global credential.helper '!f() { echo "username=git"; echo "password=${GH_TOKEN}"; }; f'
 
           if ! git clone --bare "https://github.com/$SOURCE_REPO.git" "$WORK/upstream.git"; then
             echo "克隆源仓库失败，跳过仓库同步"
@@ -48,8 +48,22 @@ jobs:
           fi
           cd "$WORK/upstream.git"
 
-          git push --all --force "https://github.com/${TARGET_REPO}.git" || echo "分支同步存在失败项"
-          git push --tags --force "https://github.com/${TARGET_REPO}.git" || echo "tags 同步存在失败项"
+          echo "→ push --all --force"
+          if git push --all --force "https://github.com/${TARGET_REPO}.git"; then
+            echo "分支同步成功"
+          else
+            echo "分支同步失败"
+          fi
+
+          echo "→ push --tags --force"
+          if git push --tags --force "https://github.com/${TARGET_REPO}.git"; then
+            echo "tags 同步成功"
+          else
+            echo "tags 同步失败"
+          fi
+
+          echo "→ 目标仓库现有 tags（前 20 个）"
+          git ls-remote --tags "https://github.com/${TARGET_REPO}.git" | head -20 || true
 
   sync-releases:
     needs: sync-repo
@@ -198,13 +212,25 @@ jobs:
 
             [ "$HTTP_STATUS" != "404" ] && continue
 
+            TAG_STATUS=$(curl -sS -4 -o /dev/null -w "%{http_code}" \
+              -H "Authorization: token $GH_TOKEN" \
+              "https://api.github.com/repos/$TARGET_REPO/git/ref/tags/$TAG_NAME") || true
+            if [ "$TAG_STATUS" != "200" ]; then
+              echo "⚠️ tag $TAG_NAME 不存在于 $TARGET_REPO（HTTP $TAG_STATUS），跳过创建。请检查 sync-repo 的 tags 同步日志。"
+              continue
+            fi
+
             CREATE_ARGS=(release create --verify-tag --repo "$TARGET_REPO" --title "$TITLE")
             printf '%s' "$BODY" > "$WORK_DIR/body.txt"
             CREATE_ARGS+=(--notes-file "$WORK_DIR/body.txt")
             [ "$IS_PRERELEASE" = "true" ] && CREATE_ARGS+=(--prerelease)
             [ "$IS_DRAFT" = "true" ] && CREATE_ARGS+=(--draft)
 
-            gh "${CREATE_ARGS[@]}" -- "$TAG_NAME" || exit 1
+            if ! gh "${CREATE_ARGS[@]}" -- "$TAG_NAME"; then
+              echo "❌ 创建 Release $TAG_NAME 失败，跳过继续"
+              rm -f "$WORK_DIR/body.txt"
+              continue
+            fi
             rm -f "$WORK_DIR/body.txt"
 
             DL_DIR=$(mktemp -d -p "$WORK_DIR")
