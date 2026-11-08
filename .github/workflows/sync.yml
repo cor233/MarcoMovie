@@ -19,14 +19,15 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          REPO=$(curl -sS -H "Authorization: token $GH_TOKEN" \
-            "https://api.github.com/repos/${{ github.repository }}" \
-            | jq -r '.parent.full_name // empty')
+          RESP=$(curl -sS --retry 3 --retry-delay 3 \
+            -H "Authorization: token $GH_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}")
+          REPO=$(echo "$RESP" | jq -r '.parent.full_name // empty')
           if [ -z "$REPO" ]; then
-            echo "❌ 无法获取 parent.full_name，当前仓库可能不是 fork。"
+            echo "parent.full_name 为空，当前仓库可能不是 fork 或 fork 关系已断开"
+            echo "$RESP" | jq '{full_name, fork, parent: .parent.full_name, source: .source.full_name}' || true
             exit 1
           fi
-          echo "解析到上游仓库: $REPO"
           echo "source_repo=$REPO" >> "$GITHUB_OUTPUT"
 
       - name: 同步所有分支和 tags
@@ -36,30 +37,19 @@ jobs:
         run: |
           set -uo pipefail
           TARGET_REPO="${{ github.repository }}"
-          AUTH_URL="https://x-access-token:${GH_TOKEN}@github.com/${TARGET_REPO}.git"
           WORK=$(mktemp -d)
           trap 'rm -rf "$WORK"' EXIT
 
-          echo "→ 克隆 $SOURCE_REPO（bare）..."
+          gh auth setup-git
+
           if ! git clone --bare "https://github.com/$SOURCE_REPO.git" "$WORK/upstream.git"; then
-            echo "❌ 克隆源仓库失败，跳过本次仓库同步（第二步仍会执行）。"
+            echo "克隆源仓库失败，跳过仓库同步"
             exit 0
           fi
           cd "$WORK/upstream.git"
 
-          echo "→ 推送所有分支到 fork..."
-          if git push --all --force "$AUTH_URL"; then
-            echo "  ✅ 分支同步完成"
-          else
-            echo "  ⚠️ 分支同步存在失败项，继续"
-          fi
-
-          echo "→ 推送 tags 到 fork..."
-          if git push --tags --force "$AUTH_URL"; then
-            echo "  ✅ tags 同步完成"
-          else
-            echo "  ⚠️ tags 同步存在失败项，继续"
-          fi
+          git push --all --force "https://github.com/${TARGET_REPO}.git" || echo "分支同步存在失败项"
+          git push --tags --force "https://github.com/${TARGET_REPO}.git" || echo "tags 同步存在失败项"
 
   sync-releases:
     needs: sync-repo
@@ -76,36 +66,29 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${SOURCE_REPO:-}" ]; then
-            echo "❌ SOURCE_REPO 为空，上游解析失败，终止 Release 同步。"
+            echo "SOURCE_REPO 为空，终止 Release 同步"
             exit 1
           fi
-          echo "使用源仓库: $SOURCE_REPO"
-
           PAGE=1
           PER_PAGE=100
           ALL_JSON="[]"
-
           while true; do
             API_URL="https://api.github.com/repos/${SOURCE_REPO}/releases?per_page=${PER_PAGE}&page=${PAGE}"
             RESPONSE=$(curl -sS -4 --retry 3 --retry-delay 3 \
               -H "Accept: application/vnd.github.v3+json" \
               -H "Authorization: token $GH_TOKEN" \
               "$API_URL")
-
             echo "$RESPONSE" | jq -e 'type == "array"' > /dev/null 2>&1 || {
               echo "API 响应不是数组" >&2
               echo "$RESPONSE" >&2
               exit 1
             }
-
             COUNT=$(echo "$RESPONSE" | jq 'length')
             [ "$COUNT" -eq 0 ] && break
-
             ALL_JSON=$(echo "$ALL_JSON" "$RESPONSE" | jq -s 'add')
             PAGE=$((PAGE + 1))
             sleep 0.5
           done
-
           echo "$ALL_JSON" | jq 'sort_by(.published_at // "")' > releases.json
 
       - name: 按顺序处理每个 Release
