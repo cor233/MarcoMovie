@@ -6,7 +6,7 @@ on:
     - cron: '0 0 * * *'
 
 jobs:
-  sync-all-releases:
+  sync-releases:
     runs-on: ubuntu-latest
     permissions:
       contents: write
