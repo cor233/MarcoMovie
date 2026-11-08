@@ -63,7 +63,7 @@ jobs:
             sleep 0.5
           done
 
-          echo "$ALL_JSON" | jq 'sort_by(.published_at // "")' > releases.json
+          echo "$ALL_JSON" | jq 'sort_by(.created_at // "", .tag_name)' > releases.json
           echo "共获取 $(jq length releases.json) 个 Release。"
 
       - name: 按顺序处理每个 Release
