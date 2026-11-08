@@ -1,0 +1,240 @@
+name: 同步仓库与 Releases
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * *'
+
+jobs:
+  sync-repo:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      source_repo: ${{ steps.resolve_source.outputs.source_repo }}
+    steps:
+      - name: 自动解析 fork 的上游仓库
+        id: resolve_source
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          REPO=$(curl -sS -H "Authorization: token $GH_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}" \
+            | jq -r '.parent.full_name // empty')
+          if [ -z "$REPO" ]; then
+            echo "❌ 无法获取 parent.full_name，当前仓库可能不是 fork。"
+            exit 1
+          fi
+          echo "解析到上游仓库: $REPO"
+          echo "source_repo=$REPO" >> "$GITHUB_OUTPUT"
+
+      - name: 同步所有分支和 tags
+        env:
+          SOURCE_REPO: ${{ steps.resolve_source.outputs.source_repo }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          TARGET_REPO="${{ github.repository }}"
+          AUTH_URL="https://x-access-token:${GH_TOKEN}@github.com/${TARGET_REPO}.git"
+          WORK=$(mktemp -d)
+          trap 'rm -rf "$WORK"' EXIT
+
+          echo "→ 克隆 $SOURCE_REPO（bare）..."
+          if ! git clone --bare "https://github.com/$SOURCE_REPO.git" "$WORK/upstream.git"; then
+            echo "❌ 克隆源仓库失败，跳过本次仓库同步（第二步仍会执行）。"
+            exit 0
+          fi
+          cd "$WORK/upstream.git"
+
+          echo "→ 推送所有分支到 fork..."
+          if git push --all --force "$AUTH_URL"; then
+            echo "  ✅ 分支同步完成"
+          else
+            echo "  ⚠️ 分支同步存在失败项，继续"
+          fi
+
+          echo "→ 推送 tags 到 fork..."
+          if git push --tags --force "$AUTH_URL"; then
+            echo "  ✅ tags 同步完成"
+          else
+            echo "  ⚠️ tags 同步存在失败项，继续"
+          fi
+
+  sync-releases:
+    needs: sync-repo
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      SOURCE_REPO: ${{ needs.sync-repo.outputs.source_repo }}
+    steps:
+      - name: 获取源仓库所有 Releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SOURCE_REPO:-}" ]; then
+            echo "❌ SOURCE_REPO 为空，上游解析失败，终止 Release 同步。"
+            exit 1
+          fi
+          echo "使用源仓库: $SOURCE_REPO"
+
+          PAGE=1
+          PER_PAGE=100
+          ALL_JSON="[]"
+
+          while true; do
+            API_URL="https://api.github.com/repos/${SOURCE_REPO}/releases?per_page=${PER_PAGE}&page=${PAGE}"
+            RESPONSE=$(curl -sS -4 --retry 3 --retry-delay 3 \
+              -H "Accept: application/vnd.github.v3+json" \
+              -H "Authorization: token $GH_TOKEN" \
+              "$API_URL")
+
+            echo "$RESPONSE" | jq -e 'type == "array"' > /dev/null 2>&1 || {
+              echo "API 响应不是数组" >&2
+              echo "$RESPONSE" >&2
+              exit 1
+            }
+
+            COUNT=$(echo "$RESPONSE" | jq 'length')
+            [ "$COUNT" -eq 0 ] && break
+
+            ALL_JSON=$(echo "$ALL_JSON" "$RESPONSE" | jq -s 'add')
+            PAGE=$((PAGE + 1))
+            sleep 0.5
+          done
+
+          echo "$ALL_JSON" | jq 'sort_by(.published_at // "")' > releases.json
+
+      - name: 按顺序处理每个 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TARGET_REPO="${{ github.repository }}"
+          UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+          WORK_DIR=$(mktemp -d)
+          trap 'rm -rf "$WORK_DIR"' EXIT
+
+          download_asset() {
+            local url="$1" name="$2" outdir="$3"
+            curl -fL -sS -4 \
+              -A "$UA" \
+              --retry 5 --retry-all-errors --retry-delay 5 \
+              --connect-timeout 30 \
+              -o "$outdir/$name" \
+              "$url" || { rm -f "$outdir/$name"; return 1; }
+          }
+
+          TOTAL=$(jq length releases.json)
+          [ "$TOTAL" -eq 0 ] && exit 0
+          jq -c '.[]' releases.json > "$WORK_DIR/list.jsonl"
+
+          while IFS= read -r release; do
+            TAG_NAME=$(echo "$release" | jq -r '.tag_name // empty')
+            [ -z "$TAG_NAME" ] && continue
+
+            TITLE=$(echo "$release" | jq -r '.name // .tag_name')
+            [ -z "$TITLE" ] && TITLE="$TAG_NAME"
+            BODY=$(echo "$release" | jq -r '.body // ""')
+            IS_PRERELEASE=$(echo "$release" | jq -r '.prerelease')
+            IS_DRAFT=$(echo "$release" | jq -r '.draft')
+
+            HTTP_STATUS=$(curl -sS -4 -o /dev/null -w "%{http_code}" \
+              -H "Authorization: token $GH_TOKEN" \
+              "https://api.github.com/repos/$TARGET_REPO/releases/tags/$TAG_NAME") || continue
+
+            if [ "$HTTP_STATUS" = "200" ]; then
+              TARGET_RELEASE=$(curl -sS -4 --retry 3 --retry-delay 3 \
+                -H "Authorization: token $GH_TOKEN" \
+                "https://api.github.com/repos/$TARGET_REPO/releases/tags/$TAG_NAME") || continue
+              echo "$TARGET_RELEASE" | jq -e '.tag_name' > /dev/null 2>&1 || continue
+
+              TARGET_TITLE=$(echo "$TARGET_RELEASE" | jq -r '.name // ""')
+              TARGET_BODY=$(echo "$TARGET_RELEASE" | jq -r '.body // ""')
+              TARGET_PRERELEASE=$(echo "$TARGET_RELEASE" | jq -r '.prerelease')
+              TARGET_DRAFT=$(echo "$TARGET_RELEASE" | jq -r '.draft')
+
+              NEED_UPDATE=0
+              [ "$TITLE" != "$TARGET_TITLE" ] && NEED_UPDATE=1
+              [ "$BODY" != "$TARGET_BODY" ] && NEED_UPDATE=1
+              [ "$IS_PRERELEASE" != "$TARGET_PRERELEASE" ] && NEED_UPDATE=1
+              [ "$IS_DRAFT" != "$TARGET_DRAFT" ] && NEED_UPDATE=1
+
+              if [ "$NEED_UPDATE" -eq 1 ]; then
+                printf '%s' "$BODY" > "$WORK_DIR/body.txt"
+                EDIT_ARGS=(release edit --repo "$TARGET_REPO" --title "$TITLE" \
+                  --notes-file "$WORK_DIR/body.txt")
+                if [ "$IS_PRERELEASE" = "true" ]; then
+                  EDIT_ARGS+=(--prerelease)
+                else
+                  EDIT_ARGS+=(--prerelease=false)
+                fi
+                if [ "$IS_DRAFT" = "true" ]; then
+                  EDIT_ARGS+=(--draft)
+                else
+                  EDIT_ARGS+=(--draft=false)
+                fi
+                gh "${EDIT_ARGS[@]}" -- "$TAG_NAME" || true
+                rm -f "$WORK_DIR/body.txt"
+              fi
+
+              SOURCE_ASSETS=$(echo "$release" | jq -r '.assets[]? | "\(.name)\t\(.size)"' | LC_ALL=C sort)
+              TARGET_ASSETS=$(echo "$TARGET_RELEASE" | jq -r '.assets[]? | select(.state=="uploaded") | "\(.name)\t\(.size)"' | LC_ALL=C sort)
+
+              if [ -n "$SOURCE_ASSETS" ] && [ -n "$TARGET_ASSETS" ]; then
+                CHANGED_ASSETS=$(LC_ALL=C comm -23 <(printf '%s' "$SOURCE_ASSETS") <(printf '%s' "$TARGET_ASSETS") || true)
+              elif [ -n "$SOURCE_ASSETS" ]; then
+                CHANGED_ASSETS="$SOURCE_ASSETS"
+              else
+                CHANGED_ASSETS=""
+              fi
+
+              if [ -n "$CHANGED_ASSETS" ]; then
+                DL_DIR=$(mktemp -d -p "$WORK_DIR")
+                UPLOAD_FILES=()
+                while IFS=$'\t' read -r asset_name asset_size; do
+                  [ -z "$asset_name" ] && continue
+                  [[ "$asset_name" == */* ]] || [[ "$asset_name" == *$'\n'* ]] && continue
+                  ASSET_URL=$(echo "$release" | jq -r --arg n "$asset_name" '[.assets[] | select(.name==$n) | .browser_download_url][0] // empty')
+                  [ -z "$ASSET_URL" ] && continue
+                  download_asset "$ASSET_URL" "$asset_name" "$DL_DIR" && UPLOAD_FILES+=("$DL_DIR/$asset_name")
+                  sleep 1
+                done <<< "$CHANGED_ASSETS"
+
+                for f in "${UPLOAD_FILES[@]}"; do
+                  gh release upload --repo "$TARGET_REPO" --clobber -- "$TAG_NAME" "$f" || true
+                done
+                rm -rf "$DL_DIR"
+              fi
+
+              continue
+            fi
+
+            [ "$HTTP_STATUS" != "404" ] && continue
+
+            CREATE_ARGS=(release create --verify-tag --repo "$TARGET_REPO" --title "$TITLE")
+            printf '%s' "$BODY" > "$WORK_DIR/body.txt"
+            CREATE_ARGS+=(--notes-file "$WORK_DIR/body.txt")
+            [ "$IS_PRERELEASE" = "true" ] && CREATE_ARGS+=(--prerelease)
+            [ "$IS_DRAFT" = "true" ] && CREATE_ARGS+=(--draft)
+
+            gh "${CREATE_ARGS[@]}" -- "$TAG_NAME" || exit 1
+            rm -f "$WORK_DIR/body.txt"
+
+            DL_DIR=$(mktemp -d -p "$WORK_DIR")
+            UPLOAD_FILES=()
+            while IFS=$'\t' read -r asset_name asset_url; do
+              [ -z "$asset_name" ] && continue
+              [[ "$asset_name" == */* ]] || [[ "$asset_name" == *$'\n'* ]] && continue
+              download_asset "$asset_url" "$asset_name" "$DL_DIR" && UPLOAD_FILES+=("$DL_DIR/$asset_name")
+              sleep 1
+            done < <(echo "$release" | jq -r '.assets[]? | select(.state=="uploaded") | "\(.name)\t\(.browser_download_url)"')
+
+            for f in "${UPLOAD_FILES[@]}"; do
+              gh release upload --repo "$TARGET_REPO" --clobber -- "$TAG_NAME" "$f" || true
+            done
+            rm -rf "$DL_DIR"
+          done < "$WORK_DIR/list.jsonl"
