@@ -16,7 +16,26 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          SOURCE_REPO="ant-video/ant-video"
+          TARGET_REPO="${{ github.repository }}"
+
+          REPO_INFO=$(curl -sS -4 --retry 3 \
+            -H "Accept: application/vnd.github.v3+json" \
+            -H "Authorization: token $GH_TOKEN" \
+            "https://api.github.com/repos/$TARGET_REPO")
+
+          if ! echo "$REPO_INFO" | jq -e '.full_name' > /dev/null 2>&1; then
+            echo "错误：获取当前仓库信息失败。" >&2
+            echo "$REPO_INFO" >&2
+            exit 1
+          fi
+
+          SOURCE_REPO=$(echo "$REPO_INFO" | jq -r '.source.full_name // empty')
+          if [ -z "$SOURCE_REPO" ]; then
+            echo "错误：当前仓库不是 fork，无法获取根仓库。" >&2
+            exit 1
+          fi
+          echo "自动识别源仓库（source）: $SOURCE_REPO"
+
           PAGE=1
           PER_PAGE=100
           ALL_JSON="[]"
@@ -76,8 +95,7 @@ jobs:
             fi
           }
 
-          TOTAL=$(jq length releases.json)
-          if [ "$TOTAL" -eq 0 ]; then
+          if [ "$(jq length releases.json)" -eq 0 ]; then
             echo "源仓库无 Release，结束。"
             exit 0
           fi
@@ -166,16 +184,9 @@ jobs:
                 rm -f "$WORK_DIR/body.txt"
               fi
 
-              SOURCE_ASSETS=$(echo "$release" | jq -r '.assets[]? | "\(.name)\t\(.size)"' | LC_ALL=C sort)
+              SOURCE_ASSETS=$(echo "$release" | jq -r '.assets[]? | select(.state=="uploaded") | "\(.name)\t\(.size)"' | LC_ALL=C sort)
               TARGET_ASSETS=$(echo "$TARGET_RELEASE" | jq -r '.assets[]? | select(.state=="uploaded") | "\(.name)\t\(.size)"' | LC_ALL=C sort)
-
-              if [ -n "$SOURCE_ASSETS" ] && [ -n "$TARGET_ASSETS" ]; then
-                CHANGED_ASSETS=$(LC_ALL=C comm -23 <(printf '%s' "$SOURCE_ASSETS") <(printf '%s' "$TARGET_ASSETS") || true)
-              elif [ -n "$SOURCE_ASSETS" ]; then
-                CHANGED_ASSETS="$SOURCE_ASSETS"
-              else
-                CHANGED_ASSETS=""
-              fi
+              CHANGED_ASSETS=$(LC_ALL=C comm -23 <(printf '%s' "$SOURCE_ASSETS") <(printf '%s' "$TARGET_ASSETS") || true)
 
               if [ -n "$CHANGED_ASSETS" ]; then
                 echo "  待补传/更新的资产："
@@ -183,13 +194,6 @@ jobs:
                 DL_DIR=$(mktemp -d -p "$WORK_DIR")
                 UPLOAD_FILES=()
                 while IFS=$'\t' read -r asset_name asset_size; do
-                  if [ -z "$asset_name" ]; then
-                    continue
-                  fi
-                  if [[ "$asset_name" == */* ]] || [[ "$asset_name" == *$'\n'* ]]; then
-                    echo "    ⚠️ 资产名含非法字符，跳过: $asset_name"
-                    continue
-                  fi
                   ASSET_URL=$(echo "$release" | jq -r --arg n "$asset_name" '[.assets[] | select(.name==$n) | .browser_download_url][0] // empty')
                   if [ -z "$ASSET_URL" ]; then
                     echo "    ⚠️ 找不到资产 URL: $asset_name"
@@ -243,13 +247,6 @@ jobs:
             DL_DIR=$(mktemp -d -p "$WORK_DIR")
             UPLOAD_FILES=()
             while IFS=$'\t' read -r asset_name asset_url; do
-              if [ -z "$asset_name" ]; then
-                continue
-              fi
-              if [[ "$asset_name" == */* ]] || [[ "$asset_name" == *$'\n'* ]]; then
-                echo "    ⚠️ 资产名含非法字符，跳过: $asset_name"
-                continue
-              fi
               if download_asset "$asset_url" "$asset_name" "$DL_DIR"; then
                 UPLOAD_FILES+=("$DL_DIR/$asset_name")
               fi
