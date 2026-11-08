@@ -208,7 +208,7 @@ jobs:
                 if [ ${#UPLOAD_FILES[@]} -gt 0 ]; then
                   for f in "${UPLOAD_FILES[@]}"; do
                     echo "  ⬆️ 上传: $(basename "$f")"
-                    if gh release upload --repo "$TARGET_REPO" -- "$TAG_NAME" "$f" --clobber; then
+                    if gh release upload --repo "$TARGET_REPO" --clobber -- "$TAG_NAME" "$f"; then
                       echo "    ✅ 上传成功"
                     else
                       echo "    ❌ 上传失败（保留现有资产，后续可重跑补传）"
@@ -256,7 +256,7 @@ jobs:
             if [ ${#UPLOAD_FILES[@]} -gt 0 ]; then
               for f in "${UPLOAD_FILES[@]}"; do
                 echo "  ⬆️ 上传: $(basename "$f")"
-                if gh release upload --repo "$TARGET_REPO" -- "$TAG_NAME" "$f" --clobber; then
+                if gh release upload --repo "$TARGET_REPO" --clobber -- "$TAG_NAME" "$f"; then
                   echo "    ✅ 上传成功"
                 else
                   echo "    ❌ 上传失败（保留现有资产，后续可重跑补传）"
